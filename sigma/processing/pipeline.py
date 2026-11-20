@@ -981,6 +981,39 @@ class ProcessingPipeline:
                 self.applied_ids.add(itid)
         return query
 
+    def absorb_nested_state(self, nested: "ProcessingPipeline") -> None:
+        """Absorb the bookkeeping state produced by a nested pipeline into this pipeline.
+
+        This is the single propagation point for nested pipelines that are driven by a
+        transformation of an enclosing pipeline (``NestedProcessingTransformation`` and
+        ``NestedQueryPostprocessingTransformation``). The nested pipeline keeps its own
+        bookkeeping containers, i.e. using a nested pipeline directly without nesting it
+        leaves all bookkeeping where it was produced. Only the following five state
+        containers are propagated, each with its historical merge semantics:
+
+        * ``applied``: appended to the applied flags of this pipeline.
+        * ``applied_ids``: unioned into the set of applied item identifiers.
+        * ``field_name_applied_ids``: per-field identifier sets overwrite equal keys of
+          this pipeline (same as ``dict.update``).
+        * ``field_mappings``: deep-merged via ``FieldMappingTracking.merge()`` so chained
+          field mappings are resolved into the final mapping ledger.
+        * ``state``: updated key-wise (same as ``dict.update``).
+
+        Items, postprocessing items, finalizers and vars are intentionally not propagated.
+        The method does not verify that the nested pipeline was applied; the caller is
+        responsible for invoking it at the point where the nested pipeline finished.
+
+        :param nested: Nested processing pipeline whose bookkeeping state is absorbed.
+        :type nested: ProcessingPipeline
+        """
+        if not isinstance(nested, ProcessingPipeline):
+            raise TypeError("Nested state can only be absorbed from another processing pipeline.")
+        self.applied.extend(nested.applied)
+        self.applied_ids.update(nested.applied_ids)
+        self.field_name_applied_ids.update(nested.field_name_applied_ids)
+        self.field_mappings.merge(nested.field_mappings)
+        self.state.update(nested.state)
+
     def finalize(self, output: Any) -> Any:
         for finalizer in self.finalizers:
             output = finalizer.apply(output)

@@ -57,6 +57,7 @@ from tests.test_processing_pipeline import (
     RuleConditionFalse,
     RuleConditionTrue,
     TransformationAppend,
+    _guard_pipeline_state_containers,
 )
 
 
@@ -2850,6 +2851,108 @@ def test_nested_pipeline_transformation_from_dict_apply(
 def test_nested_pipeline_transformation_no_items():
     with pytest.raises(SigmaConfigurationError, match="requires an 'items' key"):
         NestedProcessingTransformation.from_dict({"test": "fails"})
+
+
+def test_nested_pipeline_transformation_uses_public_absorb_nested_state(monkeypatch):
+    """Nested preprocessing delegates state propagation to ProcessingPipeline.absorb_nested_state."""
+    calls = []
+
+    def recording_absorb(self, nested):
+        calls.append((self, nested))
+
+    monkeypatch.setattr(ProcessingPipeline, "absorb_nested_state", recording_absorb)
+
+    transformation = NestedProcessingTransformation(
+        items=[ProcessingItem(TransformationAppend(s="Test"), identifier="inner")]
+    )
+    outer = ProcessingPipeline(items=[ProcessingItem(transformation, identifier="outer")])
+    rule = SigmaRule.from_dict(
+        {
+            "title": "Test",
+            "logsource": {"category": "test"},
+            "detection": {"test": {"field": "value"}, "condition": "test"},
+        }
+    )
+
+    outer.apply(rule)
+
+    assert rule.title == "TestTest"
+    assert len(calls) == 1
+    assert calls[0][0] is outer
+    assert calls[0][1] is transformation._nested_pipeline
+
+
+def test_nested_pipeline_transformation_does_not_touch_outer_state_containers(monkeypatch):
+    """The transformation reaches outer bookkeeping only through the public method."""
+    calls = []
+    monkeypatch.setattr(
+        ProcessingPipeline, "absorb_nested_state", lambda self, nested: calls.append(nested)
+    )
+
+    transformation = NestedProcessingTransformation(
+        items=[
+            ProcessingItem(FieldMappingTransformation({"fieldA": "mappedA"}), identifier="map"),
+            ProcessingItem(SetStateTransformation("index", "nested-index"), identifier="set_index"),
+        ]
+    )
+    outer = ProcessingPipeline()
+    transformation.set_pipeline(outer)
+    # Replace all five outer containers with guards that fail on any attribute access. The
+    # transformation may only reach them inside absorb_nested_state(), which is stubbed out.
+    _guard_pipeline_state_containers(monkeypatch, outer)
+    rule = SigmaRule.from_dict(
+        {
+            "title": "Test",
+            "logsource": {"category": "test"},
+            "detection": {"test": {"fieldA": "valueA"}, "condition": "test"},
+            "fields": ["fieldA"],
+        }
+    )
+
+    transformation.apply(rule)
+
+    # The rule itself was transformed by the nested pipeline.
+    assert rule.fields == ["mappedA"]
+    assert len(calls) == 1 and calls[0] is transformation._nested_pipeline
+    # The nested pipeline kept its own bookkeeping.
+    nested = transformation._nested_pipeline
+    assert nested.applied == [True, True]
+    assert nested.applied_ids == {"map", "set_index"}
+    assert nested.field_mappings == {"fieldA": {"mappedA"}}
+    assert nested.state == {"index": "nested-index"}
+
+
+def test_nested_pipeline_transformation_absorbs_all_five_containers():
+    """Outer pipeline receives the nested state of all five containers, field ledger deep-merged."""
+    transformation = NestedProcessingTransformation(
+        items=[
+            ProcessingItem(
+                FieldMappingTransformation({"fieldA": "mappedA"}), identifier="map_first"
+            ),
+            ProcessingItem(
+                FieldMappingTransformation({"mappedA": "finalA"}), identifier="map_second"
+            ),
+            ProcessingItem(SetStateTransformation("index", "nested-index"), identifier="set_index"),
+        ]
+    )
+    outer = ProcessingPipeline(items=[ProcessingItem(transformation, identifier="outer")])
+    rule = SigmaRule.from_dict(
+        {
+            "title": "Test",
+            "logsource": {"category": "test"},
+            "detection": {"test": {"fieldA": "valueA"}, "condition": "test"},
+            "fields": ["fieldA"],
+        }
+    )
+
+    outer.apply(rule)
+
+    assert outer.applied == [True, True, True, True]
+    assert outer.applied_ids == {"outer", "map_first", "map_second", "set_index"}
+    assert outer.field_name_applied_ids == {"finalA": {"map_first", "map_second"}}
+    assert outer.field_mappings == {"fieldA": {"finalA"}, "mappedA": {"finalA"}}
+    assert outer.field_mappings.target_fields["finalA"] == {"fieldA", "mappedA"}
+    assert outer.state == {"index": "nested-index"}
 
 
 def test_transformation_identifier_completeness():

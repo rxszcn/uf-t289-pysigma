@@ -1,0 +1,41 @@
+== path 1: preprocessing nested transformation ==
+rule.fields=['event.code', 'User']
+[outer after absorb]
+  applied: keys=4 content=[True, True, True, True]
+  applied_ids: keys=4 content=['map_event_code', 'map_event_id', 'outer_nest', 'set_index']
+  field_name_applied_ids: keys=1 content={'event.code': ['map_event_code', 'map_event_id']}
+  field_mappings: keys=2 content={'EventID': ['event.code'], 'event.id': ['event.code']}
+  state: keys=1 content={'index': 'governance-index'}
+[nested pipeline]
+  applied: keys=3 content=[True, True, True]
+  applied_ids: keys=3 content=['map_event_code', 'map_event_id', 'set_index']
+  field_name_applied_ids: keys=1 content={'event.code': ['map_event_code', 'map_event_id']}
+  field_mappings: keys=2 content={'EventID': ['event.code'], 'event.id': ['event.code']}
+  state: keys=1 content={'index': 'governance-index'}
+== path 2: query postprocessing nested transformation ==
+postprocessed query='[User="barbar"]'
+[outer after absorb]
+  applied: keys=0 content=[]
+  applied_ids: keys=3 content=['outer_nest', 'replace_foo', 'wrap_query']
+  field_name_applied_ids: keys=0 content={}
+  field_mappings: keys=0 content={}
+  state: keys=0 content={}
+[nested pipeline]
+  applied: keys=0 content=[]
+  applied_ids: keys=2 content=['replace_foo', 'wrap_query']
+  field_name_applied_ids: keys=0 content={}
+  field_mappings: keys=0 content={}
+  state: keys=0 content={}
+== path 3: direct use of the child pipeline (no nesting) ==
+rule.fields=['event.code', 'User']
+[direct pipeline]
+  applied: keys=3 content=[True, True, True]
+  applied_ids: keys=3 content=['map_event_code', 'map_event_id', 'set_index']
+  field_name_applied_ids: keys=1 content={'event.code': ['map_event_code', 'map_event_id']}
+  field_mappings: keys=2 content={'EventID': ['event.code'], 'event.id': ['event.code']}
+  state: keys=1 content={'index': 'governance-index'}
+ledger_trail_entries=2
+== public method call counts ==
+preprocessing_transform_calls=n/a (public method absent)
+postprocessing_transform_calls=n/a (public method absent)
+direct_path_calls=n/a (public method absent)

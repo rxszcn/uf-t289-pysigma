@@ -773,6 +773,31 @@ post-processing using the ``{vars.variable_name}`` syntax in template-enabled pa
 The pipeline state (set by ``set_state`` transformations) is accessible in post-processing
 and finalization via ``{pipeline.state[key]}``.
 
+Nested State Propagation
+------------------------
+
+A nested pipeline (``nest`` in the ``transformations`` or ``postprocessing`` sections)
+keeps its own bookkeeping. When the enclosing pipeline drives it, the resulting state is
+propagated back with ``ProcessingPipeline.absorb_nested_state()``. Both built-in nested
+transformations call this public method instead of manipulating the enclosing pipeline's
+containers directly, so custom code that needs the same propagation can rely on it:
+
+.. code-block:: python
+
+   outer_pipeline.absorb_nested_state(nested_pipeline)
+
+The method merges exactly these five containers, each with its established semantics:
+
+* ``applied``: the nested applied flags are appended.
+* ``applied_ids``: the nested identifiers are unioned into the set.
+* ``field_name_applied_ids``: per-field identifier sets overwrite equal keys.
+* ``field_mappings``: deep-merged, so chained field mappings resolve in the final ledger.
+* ``state``: keys are updated, nested values win on collisions.
+
+The nested pipeline's own bookkeeping is not cleared. Using the child pipeline directly,
+without nesting it, therefore keeps all bookkeeping on that pipeline and leaves any other
+pipeline untouched.
+
 Additionally, the backend automatically sets these pipeline variables:
 
 * ``backend``: Name of the current backend.

@@ -25,13 +25,17 @@ from sigma.processing.conditions import (
     DetectionItemProcessingCondition,
     FieldNameProcessingItemAppliedCondition,
 )
-from sigma.processing.postprocessing import EmbedQueryTransformation
+from sigma.processing.postprocessing import (
+    EmbedQueryTransformation,
+    NestedQueryPostprocessingTransformation,
+)
 from sigma.processing.transformations import (
     SetStateTransformation,
     PreprocessingTransformation,
     FieldMappingTransformation,
     AddFieldnamePrefixTransformation,
     FieldFunctionTransformation,
+    NestedProcessingTransformation,
 )
 from sigma.rule import SigmaRule, SigmaDetectionItem
 from sigma.exceptions import SigmaConfigurationError, SigmaPipelineConditionError, SigmaTypeError
@@ -1663,3 +1667,178 @@ def test_processingitem_set_pipeline_twice():
     item.set_pipeline(pipeline)
     with pytest.raises(SigmaProcessingItemError, match="Pipeline.*already set"):
         item.set_pipeline(pipeline)
+
+
+# ---------------------------------------------------------------------------
+# Nested pipeline state propagation (ProcessingPipeline.absorb_nested_state)
+# ---------------------------------------------------------------------------
+
+NESTED_STATE_CONTAINER_ATTRIBUTES = (
+    "applied",
+    "applied_ids",
+    "field_name_applied_ids",
+    "field_mappings",
+    "state",
+)
+
+
+class _StateContainerAccessGuard:
+    """Stand-in for a pipeline state container that fails on any use."""
+
+    def __init__(self, name):
+        self._name = name
+
+    def __getattr__(self, item):
+        raise AssertionError(
+            f"nested transformation accessed pipeline state container '{self._name}' directly"
+        )
+
+    def __bool__(self):
+        raise AssertionError(
+            f"nested transformation accessed pipeline state container '{self._name}' directly"
+        )
+
+    def __iter__(self):
+        raise AssertionError(
+            f"nested transformation accessed pipeline state container '{self._name}' directly"
+        )
+
+
+def _guard_pipeline_state_containers(monkeypatch, pipeline):
+    """Replace all five bookkeeping containers of *pipeline* with access guards."""
+    for name in NESTED_STATE_CONTAINER_ATTRIBUTES:
+        monkeypatch.setattr(pipeline, name, _StateContainerAccessGuard(name), raising=False)
+
+
+@pytest.fixture
+def field_mapping_nested_pipeline_items():
+    """Minimal item set producing a chained field mapping, an identifier and state."""
+    return [
+        ProcessingItem(
+            transformation=FieldMappingTransformation({"fieldA": "mappedA"}), identifier="map_first"
+        ),
+        ProcessingItem(
+            transformation=FieldMappingTransformation({"mappedA": "finalA"}),
+            identifier="map_second",
+        ),
+        ProcessingItem(
+            transformation=SetStateTransformation("index", "nested-index"), identifier="set_index"
+        ),
+    ]
+
+
+@pytest.fixture
+def field_mapping_sigma_rule():
+    return SigmaRule.from_dict(
+        {
+            "title": "Test",
+            "logsource": {"category": "test"},
+            "detection": {"test": [{"fieldA": "valueA", "fieldB": "valueB"}], "condition": "test"},
+            "fields": ["fieldA", "fieldB"],
+        }
+    )
+
+
+def test_processingpipeline_absorb_nested_state_merges_five_containers(
+    field_mapping_nested_pipeline_items, field_mapping_sigma_rule
+):
+    """Each of the five bookkeeping containers is absorbed with its historical semantics."""
+    outer = ProcessingPipeline()
+    outer.applied.append(False)
+    outer.applied_ids.add("outer_item")
+    outer.field_name_applied_ids["fieldA"].add("outer_map")
+    outer.field_name_applied_ids["finalA"].add("outer_map")
+    outer.field_name_applied_ids["untouched"].add("outer_map")
+    outer.field_mappings.add_mapping("field0", "fieldA")
+    outer.state.update({"index": "outer-index", "keep": 1})
+
+    nested = ProcessingPipeline(items=field_mapping_nested_pipeline_items)
+    nested.apply(field_mapping_sigma_rule)
+    outer.absorb_nested_state(nested)
+
+    # applied: appended in nested order
+    assert outer.applied == [False, True, True, True]
+    # applied_ids: union
+    assert outer.applied_ids == {"outer_item", "map_first", "map_second", "set_index"}
+    # field_name_applied_ids: per-field overwrite on equal keys, other keys preserved
+    assert outer.field_name_applied_ids == {
+        "finalA": {"map_first", "map_second"},
+        "fieldA": {"outer_map"},
+        "untouched": {"outer_map"},
+    }
+    # field_mappings: deep merge resolving the chained mapping across both pipelines
+    assert outer.field_mappings == {
+        "field0": {"finalA"},
+        "fieldA": {"finalA"},
+        "mappedA": {"finalA"},
+    }
+    assert outer.field_mappings.target_fields["finalA"] == {"field0", "fieldA", "mappedA"}
+    # state: key-wise update, nested value wins on colliding keys
+    assert outer.state == {"index": "nested-index", "keep": 1}
+
+
+def test_processingpipeline_absorb_nested_state_keeps_nested_bookkeeping(
+    field_mapping_nested_pipeline_items, field_mapping_sigma_rule
+):
+    """Absorption copies state out of the nested pipeline without clearing it."""
+    nested = ProcessingPipeline(items=field_mapping_nested_pipeline_items)
+    nested.apply(field_mapping_sigma_rule)
+
+    outer = ProcessingPipeline()
+    outer.absorb_nested_state(nested)
+
+    assert nested.applied == [True, True, True]
+    assert nested.applied_ids == {"map_first", "map_second", "set_index"}
+    assert nested.field_name_applied_ids == {"finalA": {"map_first", "map_second"}}
+    assert nested.field_mappings == {"fieldA": {"finalA"}, "mappedA": {"finalA"}}
+    assert nested.state == {"index": "nested-index"}
+
+
+def test_processingpipeline_direct_nested_use_keeps_bookkeeping_local(
+    field_mapping_nested_pipeline_items, field_mapping_sigma_rule
+):
+    """Using the would-be nested pipeline directly leaves all bookkeeping on that pipeline."""
+    direct = ProcessingPipeline(items=field_mapping_nested_pipeline_items)
+    enum_outer = ProcessingPipeline()
+
+    direct.apply(field_mapping_sigma_rule)
+
+    assert direct.applied == [True, True, True]
+    assert direct.applied_ids == {"map_first", "map_second", "set_index"}
+    assert direct.field_name_applied_ids == {"finalA": {"map_first", "map_second"}}
+    assert direct.field_mappings == {"fieldA": {"finalA"}, "mappedA": {"finalA"}}
+    assert direct.state == {"index": "nested-index"}
+    # The unrelated enclosing pipeline stays exactly at its initial (empty) bookkeeping.
+    assert enum_outer.applied == []
+    assert enum_outer.applied_ids == set()
+    assert enum_outer.field_name_applied_ids == {}
+    assert enum_outer.field_mappings == {}
+    assert enum_outer.state == {}
+
+
+def test_processingpipeline_absorb_nested_state_rejects_non_pipeline():
+    with pytest.raises(TypeError, match="another processing pipeline"):
+        ProcessingPipeline().absorb_nested_state(object())
+
+
+def test_processingpipeline_absorb_nested_state_does_not_need_container_access():
+    """Both nested transformations call the public method and no longer touch the five containers."""
+    import inspect
+
+    assert NESTED_STATE_CONTAINER_ATTRIBUTES == (
+        "applied",
+        "applied_ids",
+        "field_name_applied_ids",
+        "field_mappings",
+        "state",
+    )
+    for transformation_class in (
+        NestedProcessingTransformation,
+        NestedQueryPostprocessingTransformation,
+    ):
+        source = inspect.getsource(transformation_class.apply)
+        assert "absorb_nested_state" in source
+        for container in NESTED_STATE_CONTAINER_ATTRIBUTES:
+            assert (
+                re.search(rf"\b\w+_pipeline\.{container}\b", source) is None
+            ), f"{transformation_class.__name__}.apply accesses container '{container}' directly"

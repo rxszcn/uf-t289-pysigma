@@ -14,6 +14,7 @@ from sigma.processing.postprocessing import (
 )
 from sigma.rule import SigmaRule
 from .test_processing_transformations import dummy_pipeline, sigma_rule
+from .test_processing_pipeline import _guard_pipeline_state_containers
 
 _ALLOW_VARS_POLICY = SigmaPolicy(regex_engine=RE2RegexEngine(), allow_template_vars=True)
 
@@ -180,6 +181,87 @@ def test_nested_query_postprocessing_transformation(
     result = nested_query_postprocessing_transformation.apply(sigma_rule, 'field="foobar"')
     assert result == 'title = Test\nquery = [field="barbar"]'
     assert sigma_rule.was_processed_by("test")
+
+
+def test_nested_query_postprocessing_transformation_uses_public_absorb_nested_state(monkeypatch):
+    """Nested postprocessing delegates state propagation to ProcessingPipeline.absorb_nested_state."""
+    calls = []
+
+    def recording_absorb(self, nested):
+        calls.append((self, nested))
+
+    monkeypatch.setattr(ProcessingPipeline, "absorb_nested_state", recording_absorb)
+
+    transformation = NestedQueryPostprocessingTransformation(
+        items=[QueryPostprocessingItem(EmbedQueryTransformation("[", "]"), identifier="inner")]
+    )
+    outer = ProcessingPipeline(
+        postprocessing_items=[QueryPostprocessingItem(transformation, identifier="outer")]
+    )
+    rule = SigmaRule.from_dict(
+        {
+            "title": "Test",
+            "logsource": {"category": "test"},
+            "detection": {"test": {"field": "value"}, "condition": "test"},
+        }
+    )
+
+    assert outer.postprocess_query(rule, "field=value") == "[field=value]"
+    assert len(calls) == 1
+    assert calls[0][0] is outer
+    assert calls[0][1] is transformation._nested_pipeline
+
+
+def test_nested_query_postprocessing_transformation_does_not_touch_outer_state_containers(
+    monkeypatch,
+):
+    """The transformation reaches outer bookkeeping only through the public method."""
+    calls = []
+    monkeypatch.setattr(
+        ProcessingPipeline, "absorb_nested_state", lambda self, nested: calls.append(nested)
+    )
+
+    transformation = NestedQueryPostprocessingTransformation(
+        items=[QueryPostprocessingItem(EmbedQueryTransformation("[", "]"), identifier="inner")]
+    )
+    outer = ProcessingPipeline()
+    transformation.set_pipeline(outer)
+    _guard_pipeline_state_containers(monkeypatch, outer)
+    rule = SigmaRule.from_dict(
+        {
+            "title": "Test",
+            "logsource": {"category": "test"},
+            "detection": {"test": {"field": "value"}, "condition": "test"},
+        }
+    )
+
+    assert transformation.apply(rule, "field=value") == "[field=value]"
+    assert len(calls) == 1 and calls[0] is transformation._nested_pipeline
+    assert transformation._nested_pipeline.applied_ids == {"inner"}
+
+
+def test_nested_query_postprocessing_transformation_absorbs_applied_ids():
+    """Absorbed nested postprocessing identifiers are visible on the enclosing pipeline."""
+    transformation = NestedQueryPostprocessingTransformation(
+        items=[
+            QueryPostprocessingItem(ReplaceQueryTransformation("foo", "bar"), identifier="replace"),
+            QueryPostprocessingItem(EmbedQueryTransformation("[", "]"), identifier="wrap"),
+        ]
+    )
+    outer = ProcessingPipeline(
+        postprocessing_items=[QueryPostprocessingItem(transformation, identifier="outer")]
+    )
+    rule = SigmaRule.from_dict(
+        {
+            "title": "Test",
+            "logsource": {"category": "test"},
+            "detection": {"test": {"field": "value"}, "condition": "test"},
+        }
+    )
+
+    assert outer.postprocess_query(rule, 'field="foobar"') == '[field="barbar"]'
+    assert outer.applied_ids == {"outer", "replace", "wrap"}
+    assert transformation._nested_pipeline.applied_ids == {"replace", "wrap"}
 
 
 def test_query_template_transformation_with_vars(

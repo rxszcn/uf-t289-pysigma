@@ -187,7 +187,7 @@ class NestedQueryPostprocessingTransformation(QueryPostprocessingTransformation)
         super().apply(rule, query)
         query = self._nested_pipeline.postprocess_query(rule, query)
         if self._pipeline is not None:
-            self._pipeline.applied_ids.update(self._nested_pipeline.applied_ids)
+            self._pipeline.absorb_nested_state(self._nested_pipeline)
         return query
 
 
